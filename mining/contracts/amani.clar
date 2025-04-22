@@ -1,4 +1,5 @@
-;; Consensus Mining Network 
+;; Consensus Mining Network - Stage 3
+;; A blockchain-based system for coordinating consensus mining operations and distributing rewards
 
 ;; Constants
 (define-constant ERR-NOT-COORDINATOR (err u1))
@@ -7,14 +8,16 @@
 (define-constant ERR-BLOCK-ALREADY-MINED (err u4))
 (define-constant ERR-INVALID-NONCE (err u5))
 (define-constant ERR-TIMEOUT-ACTIVE (err u6))
-(define-constant ERR-INVALID-PARAMETER (err u7))
-(define-constant ERR-BLOCK-EXISTS (err u8))
+(define-constant ERR-INSUFFICIENT-STAKE (err u7))
+(define-constant ERR-INVALID-PARAMETER (err u8))
+(define-constant ERR-BLOCK-EXISTS (err u9))
 (define-constant MAX-BLOCK-ID u100) ;; Maximum allowed block ID
 
 ;; Data Variables
 (define-data-var network-coordinator principal tx-sender)
 (define-data-var network-active bool false)
 (define-data-var current-difficulty uint u0)
+(define-data-var miner-stake uint u1000000) ;; 1 STX required stake
 (define-data-var total-reward-pool uint u0)
 (define-data-var chain-height uint u0) ;; Block height tracking for timeouts
 
@@ -23,7 +26,7 @@
     uint
     {
         target-hash: (string-utf8 256),
-        solution-nonce: (buff 32),
+        solution-nonce: (buff 32),     ;; SHA256 hash of the expected mining solution
         timeout: uint,                 ;; Timeout period end block height
         block-reward: uint,
         mined: bool
@@ -35,7 +38,7 @@
     principal
     {
         assigned-block: uint,
-        mined-blocks: (list 15 uint),
+        mined-blocks: (list 20 uint),
         last-activity: uint,
         total-mined: uint
     }
@@ -48,6 +51,12 @@
         attempts: uint,
         mined-at: (optional uint)
     }
+)
+
+;; Events
+(define-map mining-successes
+    uint
+    (list 10 {miner: principal, timestamp: uint})
 )
 
 ;; Authorization
@@ -78,6 +87,13 @@
         (var-set network-active false)
         (ok true)))
 
+(define-public (update-stake-requirement (new-stake uint))
+    (begin
+        (asserts! (is-coordinator) ERR-NOT-COORDINATOR)
+        (asserts! (> new-stake u0) ERR-INVALID-PARAMETER)
+        (var-set miner-stake new-stake)
+        (ok true)))
+
 (define-public (register-block
     (block-id uint)
     (target-hash (string-utf8 256))
@@ -86,7 +102,6 @@
     (block-reward uint))
     (begin
         (asserts! (is-coordinator) ERR-NOT-COORDINATOR)
-        (asserts! (var-get network-active) ERR-NETWORK-PAUSED)
         
         ;; Validate block-id is within acceptable range
         (asserts! (<= block-id MAX-BLOCK-ID) ERR-INVALID-PARAMETER)
@@ -118,7 +133,9 @@
             
         ;; Calculate new reward pool safely
         (let ((new-pool (+ (var-get total-reward-pool) block-reward)))
+            ;; Make sure the addition doesn't overflow
             (asserts! (>= new-pool (var-get total-reward-pool)) ERR-INVALID-PARAMETER)
+            ;; Update the total reward pool
             (var-set total-reward-pool new-pool))
         (ok true)))
 
@@ -126,6 +143,8 @@
 (define-public (register-as-miner)
     (begin
         (asserts! (var-get network-active) ERR-NETWORK-PAUSED)
+        ;; Require miner stake
+        (try! (stx-transfer? (var-get miner-stake) tx-sender (var-get network-coordinator)))
         
         (map-set miner-profiles tx-sender
             {
@@ -165,7 +184,7 @@
                     mined-at: none
                 }))
         
-        ;; Verify solution nonce
+        ;; Verify solution nonce - directly compare the nonces
         (if (is-eq nonce-solution (get solution-nonce block))
             (begin
                 ;; Update block status
@@ -177,13 +196,13 @@
                     (merge miner {
                         assigned-block: (+ block-id u1),
                         mined-blocks: (unwrap! (as-max-len? 
-                            (append (get mined-blocks miner) block-id) u15)
+                            (append (get mined-blocks miner) block-id) u20)
                             ERR-INVALID-BLOCK),
                         last-activity: current-height,
                         total-mined: (+ (get total-mined miner) u1)
                     }))
                 
-                ;; Update mining record
+                ;; Record mining
                 (map-set block-mining-records
                     {block-id: block-id, miner: tx-sender}
                     {
@@ -195,6 +214,16 @@
                 
                 ;; Distribute block reward
                 (try! (stx-transfer? (get block-reward block) (var-get network-coordinator) tx-sender))
+                
+                ;; Record success
+                (match (map-get? mining-successes block-id)
+                    successes (map-set mining-successes block-id
+                        (unwrap! (as-max-len?
+                            (append successes {miner: tx-sender, timestamp: current-height})
+                            u10)
+                            ERR-INVALID-BLOCK))
+                    (map-set mining-successes block-id
+                        (list {miner: tx-sender, timestamp: current-height})))
                 
                 (ok true))
             ERR-INVALID-NONCE)))
@@ -213,6 +242,9 @@
 (define-read-only (get-miner-history (miner principal) (block-id uint))
     (map-get? block-mining-records {block-id: block-id, miner: miner}))
 
+(define-read-only (get-mining-history (block-id uint))
+    (map-get? mining-successes block-id))
+
 (define-read-only (get-current-height)
     (var-get chain-height))
 
@@ -221,5 +253,20 @@
         active: (var-get network-active),
         current-difficulty: (var-get current-difficulty),
         total-reward-pool: (var-get total-reward-pool),
+        miner-stake: (var-get miner-stake),
         chain-height: (var-get chain-height)
     })
+
+;; Coordinator functions
+(define-public (withdraw-funds (amount uint) (recipient principal))
+    (begin
+        (asserts! (is-coordinator) ERR-NOT-COORDINATOR)
+        (try! (stx-transfer? amount (var-get network-coordinator) recipient))
+        (ok true)))
+
+(define-public (refund-stake (miner principal))
+    (begin
+        (asserts! (is-coordinator) ERR-NOT-COORDINATOR)
+        (asserts! (is-some (map-get? miner-profiles miner)) ERR-INVALID-PARAMETER)
+        (try! (stx-transfer? (var-get miner-stake) (var-get network-coordinator) miner))
+        (ok true)))
